@@ -1,99 +1,131 @@
-"""
-Provides functionality to interact with image processing services.
-
-For more details about this component, please refer to the documentation at
-https://home-assistant.io/components/image_processing/
-"""
+"""Provides functionality to interact with image processing services."""
 import asyncio
 from datetime import timedelta
 import logging
+from typing import Tuple
 
+from PIL import ImageDraw
 import voluptuous as vol
 
-from homeassistant.const import (
-    ATTR_ENTITY_ID, ATTR_NAME, CONF_ENTITY_ID, CONF_NAME)
+from homeassistant.const import ATTR_ENTITY_ID, ATTR_NAME, CONF_ENTITY_ID, CONF_NAME
 from homeassistant.core import callback
 from homeassistant.exceptions import HomeAssistantError
 import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers.config_validation import ENTITY_SERVICE_SCHEMA
 from homeassistant.helpers.entity import Entity
 from homeassistant.helpers.entity_component import EntityComponent
-from homeassistant.loader import bind_hass
 from homeassistant.util.async_ import run_callback_threadsafe
+
+# mypy: allow-untyped-defs, no-check-untyped-defs
 
 _LOGGER = logging.getLogger(__name__)
 
-DOMAIN = 'image_processing'
-DEPENDENCIES = ['camera']
-
+DOMAIN = "image_processing"
 SCAN_INTERVAL = timedelta(seconds=10)
 
 DEVICE_CLASSES = [
-    'alpr',        # Automatic license plate recognition
-    'face',        # Face
-    'ocr',         # OCR
+    "alpr",  # Automatic license plate recognition
+    "face",  # Face
+    "ocr",  # OCR
 ]
 
-SERVICE_SCAN = 'scan'
+SERVICE_SCAN = "scan"
 
-EVENT_DETECT_FACE = 'image_processing.detect_face'
+EVENT_DETECT_FACE = "image_processing.detect_face"
 
-ATTR_AGE = 'age'
-ATTR_CONFIDENCE = 'confidence'
-ATTR_FACES = 'faces'
-ATTR_GENDER = 'gender'
-ATTR_GLASSES = 'glasses'
-ATTR_MOTION = 'motion'
-ATTR_TOTAL_FACES = 'total_faces'
+ATTR_AGE = "age"
+ATTR_CONFIDENCE = "confidence"
+ATTR_FACES = "faces"
+ATTR_GENDER = "gender"
+ATTR_GLASSES = "glasses"
+ATTR_MOTION = "motion"
+ATTR_TOTAL_FACES = "total_faces"
 
-CONF_SOURCE = 'source'
-CONF_CONFIDENCE = 'confidence'
+CONF_SOURCE = "source"
+CONF_CONFIDENCE = "confidence"
 
 DEFAULT_TIMEOUT = 10
 DEFAULT_CONFIDENCE = 80
 
-SOURCE_SCHEMA = vol.Schema({
-    vol.Required(CONF_ENTITY_ID): cv.entity_domain('camera'),
-    vol.Optional(CONF_NAME): cv.string,
-})
+SOURCE_SCHEMA = vol.Schema(
+    {
+        vol.Required(CONF_ENTITY_ID): cv.entity_domain("camera"),
+        vol.Optional(CONF_NAME): cv.string,
+    }
+)
 
-PLATFORM_SCHEMA = cv.PLATFORM_SCHEMA.extend({
-    vol.Optional(CONF_SOURCE): vol.All(cv.ensure_list, [SOURCE_SCHEMA]),
-    vol.Optional(CONF_CONFIDENCE, default=DEFAULT_CONFIDENCE):
-        vol.All(vol.Coerce(float), vol.Range(min=0, max=100)),
-})
-
-SERVICE_SCAN_SCHEMA = vol.Schema({
-    vol.Optional(ATTR_ENTITY_ID): cv.entity_ids,
-})
-
-
-@bind_hass
-def scan(hass, entity_id=None):
-    """Force process an image."""
-    data = {ATTR_ENTITY_ID: entity_id} if entity_id else None
-    hass.services.call(DOMAIN, SERVICE_SCAN, data)
+PLATFORM_SCHEMA = cv.PLATFORM_SCHEMA.extend(
+    {
+        vol.Optional(CONF_SOURCE): vol.All(cv.ensure_list, [SOURCE_SCHEMA]),
+        vol.Optional(CONF_CONFIDENCE, default=DEFAULT_CONFIDENCE): vol.All(
+            vol.Coerce(float), vol.Range(min=0, max=100)
+        ),
+    }
+)
+PLATFORM_SCHEMA_BASE = cv.PLATFORM_SCHEMA_BASE.extend(PLATFORM_SCHEMA.schema)
 
 
-@asyncio.coroutine
-def async_setup(hass, config):
+def draw_box(
+    draw: ImageDraw,
+    box: Tuple[float, float, float, float],
+    img_width: int,
+    img_height: int,
+    text: str = "",
+    color: Tuple[int, int, int] = (255, 255, 0),
+) -> None:
+    """
+    Draw a bounding box on and image.
+
+    The bounding box is defined by the tuple (y_min, x_min, y_max, x_max)
+    where the coordinates are floats in the range [0.0, 1.0] and
+    relative to the width and height of the image.
+
+    For example, if an image is 100 x 200 pixels (height x width) and the bounding
+    box is `(0.1, 0.2, 0.5, 0.9)`, the upper-left and bottom-right coordinates of
+    the bounding box will be `(40, 10)` to `(180, 50)` (in (x,y) coordinates).
+    """
+
+    line_width = 3
+    font_height = 8
+    y_min, x_min, y_max, x_max = box
+    (left, right, top, bottom) = (
+        x_min * img_width,
+        x_max * img_width,
+        y_min * img_height,
+        y_max * img_height,
+    )
+    draw.line(
+        [(left, top), (left, bottom), (right, bottom), (right, top), (left, top)],
+        width=line_width,
+        fill=color,
+    )
+    if text:
+        draw.text(
+            (left + line_width, abs(top - line_width - font_height)), text, fill=color
+        )
+
+
+async def async_setup(hass, config):
     """Set up the image processing."""
     component = EntityComponent(_LOGGER, DOMAIN, hass, SCAN_INTERVAL)
 
-    yield from component.async_setup(config)
+    await component.async_setup(config)
 
-    @asyncio.coroutine
-    def async_scan_service(service):
+    async def async_scan_service(service):
         """Service handler for scan."""
-        image_entities = component.async_extract_from_service(service)
+        image_entities = await component.async_extract_from_service(service)
 
-        update_task = [entity.async_update_ha_state(True) for
-                       entity in image_entities]
-        if update_task:
-            yield from asyncio.wait(update_task, loop=hass.loop)
+        update_tasks = []
+        for entity in image_entities:
+            entity.async_set_context(service.context)
+            update_tasks.append(entity.async_update_ha_state(True))
+
+        if update_tasks:
+            await asyncio.wait(update_tasks)
 
     hass.services.async_register(
-        DOMAIN, SERVICE_SCAN, async_scan_service,
-        schema=SERVICE_SCAN_SCHEMA)
+        DOMAIN, SERVICE_SCAN, async_scan_service, schema=ENTITY_SERVICE_SCHEMA
+    )
 
     return True
 
@@ -124,8 +156,7 @@ class ImageProcessingEntity(Entity):
         """
         return self.hass.async_add_job(self.process_image, image)
 
-    @asyncio.coroutine
-    def async_update(self):
+    async def async_update(self):
         """Update image and process it.
 
         This method is a coroutine.
@@ -134,15 +165,16 @@ class ImageProcessingEntity(Entity):
         image = None
 
         try:
-            image = yield from camera.async_get_image(
-                self.camera_entity, timeout=self.timeout)
+            image = await camera.async_get_image(
+                self.camera_entity, timeout=self.timeout
+            )
 
         except HomeAssistantError as err:
             _LOGGER.error("Error on receive image from entity: %s", err)
             return
 
         # process image data
-        yield from self.async_process_image(image.content)
+        await self.async_process_image(image.content)
 
 
 class ImageProcessingFaceEntity(ImageProcessingEntity):
@@ -181,22 +213,20 @@ class ImageProcessingFaceEntity(ImageProcessingEntity):
     @property
     def device_class(self):
         """Return the class of this device, from component DEVICE_CLASSES."""
-        return 'face'
+        return "face"
 
     @property
     def state_attributes(self):
         """Return device specific state attributes."""
-        attr = {
-            ATTR_FACES: self.faces,
-            ATTR_TOTAL_FACES: self.total_faces,
-        }
+        attr = {ATTR_FACES: self.faces, ATTR_TOTAL_FACES: self.total_faces}
 
         return attr
 
     def process_faces(self, faces, total):
         """Send event with detected faces and store data."""
         run_callback_threadsafe(
-            self.hass.loop, self.async_process_faces, faces, total).result()
+            self.hass.loop, self.async_process_faces, faces, total
+        ).result()
 
     @callback
     def async_process_faces(self, faces, total):
@@ -223,9 +253,7 @@ class ImageProcessingFaceEntity(ImageProcessingEntity):
                     continue
 
             face.update({ATTR_ENTITY_ID: self.entity_id})
-            self.hass.async_add_job(
-                self.hass.bus.async_fire, EVENT_DETECT_FACE, face
-            )
+            self.hass.async_add_job(self.hass.bus.async_fire, EVENT_DETECT_FACE, face)
 
         # Update entity store
         self.faces = faces
